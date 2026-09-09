@@ -1,2 +1,6 @@
 down-site-logs
 incident-report
+
+# macOS
+.DS_Store
+**/.DS_Store
