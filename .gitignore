@@ -10,3 +10,7 @@ configuration.php
 # macOS
 .DS_Store
 **/.DS_Store
+
+# Node.js
+node_modules
+**/node_modules
