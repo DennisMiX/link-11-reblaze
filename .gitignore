@@ -1,6 +1,11 @@
 down-site-logs
 incident-report
 screenshots
+joomla-system-information
+
+# Joomla secrets (DB credentials, secret key) — never track regardless of location
+configuration.php
+**/configuration.php
 
 # macOS
 .DS_Store

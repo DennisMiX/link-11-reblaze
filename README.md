@@ -62,7 +62,9 @@ From the incident report docx and the raw JSON export (1,000 sampled rows, ~3.3 
 
 Priorities below are ordered by what unblocks work fastest: (1) get the 3 known users working on `powerfleet.com`, (2) replicate that to the other 4 domains, (3) — most time-consuming, so last — build a durable process for adding future editors across all domains. Background/diagnostic detail follows after the action plan.
 
-### Priority 1: Restore access for the 3 known users on `powerfleet.com`
+### Priority 1: Restore access for the 3 known users on `powerfleet.com` — ✅ Applied (interim), 2026-09-10
+**Status: resolved on `powerfleet.com`.** MD/AU/DF's IPs have been whitelisted and the team can now create/read/update/delete content in the CMS again. This is confirmed **not a long-term fix** — it's the interim IP Bypass workaround described below, not a resolution of the underlying `473` false positive — so the Link11 ticket and Priority 2/3 work below remain open.
+
 Reblaze ACL Rules support a **Bypass** operation on an **IP Address** match — per Link11's [Profile Concepts](https://waap.docs.link11.com/v2.16/product-walkthrough/security/profiles/profile-concepts) and [ACL Policies](https://waap.docs.link11.com/v2.16/product-walkthrough/security/profiles/acl-policies) docs, "the requestor will be granted access to the requested resource, without further evaluation or filtering" — including WAF/content-filter checks (still logged as `reason:bypassed`, so it's auditable). This is different from **Allow**, which still runs the WAF; **Bypass** is what's needed since the block is content-filtering, not an ACL denial. It does **not** require Link11 to identify the exact triggering rule first — it sidesteps the false positive immediately while the Link11 ticket (below) works the permanent fix in parallel.
 
 **Action:** in the Reblaze console, edit (or create) the ACL Policy assigned to the `/administrator` resource — mapped under **Web Proxy → Security Profiles** — and add one Rule per known editor: **Match: IP Address**, **Operation: Bypass**.
@@ -76,9 +78,9 @@ Reblaze ACL Rules support a **Bypass** operation on an **IP Address** match — 
 - Name the policy clearly, e.g. **"Trusted CMS Editors — Admin Bypass"**, so its purpose and scope are obvious to anyone reviewing it later.
 - **Scope tightly:** apply only to the `/administrator` resource definition (not the whole domain) and to these individual IPs (not a range), so this doesn't open a general WAF bypass on public-facing pages.
 - Confirm with MD and AU whether `142.114.5.61` and `156.155.11.93` are static IPs — DF's `156.155.21.7` is already confirmed stable (repeated across two separate blocked requests). A Bypass Rule silently stops matching if the IP changes.
-- [ ] Add the 3 Rules above to the ACL Policy on `powerfleet.com` today.
-- [ ] Confirm MD/AU's IPs are static.
-- [ ] Re-test save flows across the failing content types (see breakdown below) once applied.
+- [x] Add the 3 Rules above to the ACL Policy on `powerfleet.com` today. — **Done 2026-09-10.**
+- [ ] Confirm MD/AU's IPs are static (still worth confirming even though access is currently working, so it doesn't silently break later).
+- [x] Re-test save flows across the failing content types (see breakdown below) once applied. — **Confirmed working: CRUD on the CMS is restored for all 3 users on `powerfleet.com`.**
 
 ### Priority 2: Replicate the same access to the other 4 domains
 The same access is needed on:
@@ -92,6 +94,19 @@ Per Link11's [Web Proxy](https://waap.docs.link11.com/v2.16/product-walkthrough/
 - [ ] Re-create/re-assign the same "Trusted CMS Editors — Admin Bypass" Policy (MD/AU/DF) against each of the 4 domains' own `/administrator` resource definitions.
 - [ ] Test whether the same `473` false positive even reproduces on each domain before assuming it does — `compliance.mixtelematics.com` and `www.mixtelematics.com` may run a different CMS/version or WAF configuration than the Joomla powerfleet.com sites, so don't assume identical behavior.
 - [ ] Widen the Link11 support ticket (draft below) to cover all 5 domains up front, rather than raising a separate ticket per domain later.
+
+**Note (2026-09-10):** `marketing.powerfleet.com` is back up and confirmed CRUD-working in the admin, and is being used as a **staging/test clone** for the Joomla-side performance changes (Redis cache/session handler, OPcache JIT, `behind_loadbalancer`, etc. — see the performance TODO). It has **not** been confirmed to have identical Link11/Reblaze config to `powerfleet.com`, so a clean result there validates the Joomla/PHP-level changes but does **not** confirm the 504/Proxy-Timeout fix for the live site — that still needs to be verified on `powerfleet.com` itself once Link11 actions the timeout increase.
+
+**Performance-testing incident (2026-09-10):** first attempt at switching `cache_handler` to `redis` on the `marketing.powerfleet.com` config (`joomla-system-information/dev/configuration.php`) caused a full **500 fatal error** site-wide. Cause not yet confirmed, but `redis_server_host` is set to `localhost` with a blank `redis_server_auth` — either the Redis service isn't reachable at that host/port from this environment, or auth is required and missing. Reverted `cache_handler` back to `file` and `caching` back to `0` (matching the pre-change working state); site confirmed back up with no errors. **Before retrying:** confirm the actual Redis host/port/auth this hosting environment expects (check hPanel or ask Hostinger support) rather than assuming `localhost` is correct, then retry the cache-handler change in isolation and watch for errors immediately.
+
+**Performance work paused (2026-09-10):** while checking whether Redis is even available on this Cloud Enterprise Plus plan, an SSH connection attempt returned a **"REMOTE HOST IDENTIFICATION HAS CHANGED"** warning (host key mismatch) for the hosting server. Hostinger's own support was asked directly and **could not confirm** whether a server migration/rebuild had occurred, and explicitly advised not to accept the new fingerprint without independent confirmation. Since that confirmation isn't available, and Redis was only an optimization (not a fix for anything currently broken), **the Redis cache/session handler work is dropped for now** — not worth the risk of proceeding on an unverified SSH connection.
+
+**Pivoted to an SSH-free alternative (2026-09-10):** the remaining performance items don't actually require SSH at all — they can be done via hPanel's PHP Configuration page or the Joomla admin/File Manager:
+- Enable Joomla's built-in **file-based caching** (`caching: 1`, `cache_handler: file`) via **System → Global Configuration → Cache** in the Joomla admin — zero risk, no file edits or SSH needed, uses the cache handler already confirmed stable. — ✅ **Confirmed correct, 2026-09-10** (System Cache: ON – Conservative caching, Cache Handler: File, all other Cache/Session tab values already correct — see screenshots `global-system-01.png`/`global-system-02.png`).
+- Set `opcache.jit_buffer_size` via hPanel's **PHP Configuration** page (not `php.ini` over SSH). — ❌ **Dropped, confirmed 2026-09-10.** Manually re-checked all 8 PHP Configuration screenshots (`screenshots/php-ss/`) field-by-field — no `opcache.jit`/`opcache.jit_buffer_size` field or custom directive box exists. Then asked Hostinger's AI support agent directly, who confirmed: PHP 8.3.33 is active and OPcache is enabled, but JIT is **not exposed as a supported per-site option** on this Cloud Enterprise Plus plan — not via hPanel, not via a `.user.ini` workaround (JIT requires system-level PHP config, and direct `php.ini` access is disabled on Web/Cloud hosting), and not as a support-side override. Hostinger's own recommendation: only a VPS (where you control PHP config directly) supports this; otherwise use the already-available OPcache settings (`opcache.memoryConsumption`, `opcache.maxAcceleratedFiles`, etc., already confirmed set correctly at 384M/10000). Treated as fully closed — no further action possible on this plan tier.
+- Set `behind_loadbalancer: true` and clean up the unused Memcached config via a direct `configuration.php` edit through hPanel's File Manager (already how the earlier Redis revert was done).
+
+These are being worked one at a time, same testing discipline as before (change → test → confirm → next). File-based caching is done, OPcache JIT is confirmed unavailable and closed; next up is `behind_loadbalancer`.
 
 ### Priority 3 (most time-consuming): durable process for onboarding future editors, across all domains
 This is the long-tail work — lower priority than getting today's 3 users unblocked, but necessary so this doesn't become a recurring bottleneck as headcount grows.
@@ -164,8 +179,7 @@ Per Link11's own docs on the [URL Whitelist](https://docs.link11.com/product-gui
 > 3. Confirm whether this needs a policy change on Link11's side, or a configuration change we can make ourselves in the WAF/IPS Policies interface, on each of the 5 domains.
 
 ### Current blockers (admin-blocking issue)
-- **Admin users cannot reliably save/edit Joomla content on `powerfleet.com`** — affecting both YOOtheme builder pages and several standard content types (see breakdown above), blocking day-to-day content work.
-- **The Priority 1 IP Bypass fix has not yet been applied** — this is the fastest known path to restoring editing for MD/AU/DF, pending someone with Reblaze console access implementing it.
+- **`powerfleet.com` admin access is restored (interim)** — MD/AU/DF's IPs are whitelisted via the ACL Bypass Policy, and the team can CRUD content in the CMS again. This is **not a long-term fix**; it's a workaround pending Link11's root-cause fix for the `473`.
 - **Fix not yet extended to the other 4 domains** — each is a separate Web Application in Reblaze, so it needs replicating individually, and may not share `powerfleet.com`'s exact WAF behavior.
 - **Root cause not yet confirmed by Link11** — awaiting their log lookup on the Request ID/Session ID above to identify the exact rule/signature; the IP Bypass is a workaround, not a fix.
 - **Whitelisting more URLs is not a safe fix on its own** — URL Whitelist entries bypass WAF/WebDDoS/Bot Management entirely for that path, so broad whitelisting of admin routes would reduce protection rather than targeting the specific false positive.
