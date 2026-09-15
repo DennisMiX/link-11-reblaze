@@ -184,3 +184,82 @@ Per Link11's own docs on the [URL Whitelist](https://docs.link11.com/product-gui
 - **Root cause not yet confirmed by Link11** — awaiting their log lookup on the Request ID/Session ID above to identify the exact rule/signature; the IP Bypass is a workaround, not a fix.
 - **Whitelisting more URLs is not a safe fix on its own** — URL Whitelist entries bypass WAF/WebDDoS/Bot Management entirely for that path, so broad whitelisting of admin routes would reduce protection rather than targeting the specific false positive.
 - **No durable onboarding process yet for future editors** (Priority 3) — needed before headcount grows, but intentionally lower priority than restoring today's access.
+
+## 2026-09-11 — 502 Bad Gateway / Proxy Timeout on YOOtheme Pro Page Save (`www.powerfleet.com`)
+
+Sources: [screenshots/502-ange-screenshots-ytp-joomla/](screenshots/502-ange-screenshots-ytp-joomla/), `payload.rtf`, `request headers.rtf`, [screenshots/Link11EventLog-502.txt](screenshots/Link11EventLog-502.txt).
+
+### What happened
+- **Date & Exact Timestamp:** `2026-09-11 11:09:17 UTC` (response `Date: Fri, 11 Sep 2026 11:09:17 GMT`).
+- **Target URL & Method:** `POST https://www.powerfleet.com/us/icubed-2027/`
+- **Initiator:** YOOtheme Pro Customizer (`customizer.js`) saving layout/article `id=3594` (`templateStyle=20`).
+- **Payload:** `application/x-www-form-urlencoded`, `Content-Length: 48084` (~48 KB) containing encoded YOOtheme page builder data (`customizer` parameter).
+- **Behavior:** The browser stalled for **19.94 seconds** in `Waiting for server response (TTFB)`, after which the proxy returned an HTTP **502 Bad Gateway** HTML page (`<center>openresty</center>`) generated in 0.40 ms.
+- **Link11 Edge Trace Header:** `X-L11-Trace: lon2-lb2`
+- **Subsequent Traffic:** Subsequent requests (tracking pixels, Google Analytics, clarity, and Joomla session keepalive calls `index.php?option=com_ajax&format=json`) immediately succeeded with HTTP `200`. No WAF challenge or 473 denial was returned.
+
+### Hostinger investigation findings (2026-09-14)
+- **Origin execution duration:** Neighboring successful `POST /us/icubed-2027/` requests at 11:05:15 UTC and 11:07:52 UTC took **286 to 320 seconds (~5 minutes)** each to complete on the origin server.
+- **LVE Limits:** Normal across the 10:00–12:00 UTC window (CPU ~5%, RAM ~600MB of 15GB, PHP workers 11 of 400). No account-level throttling or resource exhaustion occurred.
+- **Root cause:** The 502 Bad Gateway was an **upstream proxy timeout mismatch**: Link11/OpenResty has a default ~20-second upstream timeout, whereas the Joomla/YOOtheme save operation on this heavy page required ~300 seconds to finish processing due to YOOtheme Next-Gen Image (WebP) dynamic re-rendering on every save. Because the origin took minutes to reply, Link11 terminated the upstream connection at ~20s and rendered the 502 (and caused the browser to lose/invalidate the editor session state).
+
+### Solution & Resolution Testing (2026-09-14)
+- **Direct Origin Bypass Test (`/etc/hosts` → `92.112.186.38`):** ✅ **100% SUCCESS.** When bypassing Link11/Reblaze and saving `icubed-2027` directly on the Hostinger origin, the save completed cleanly with **no 502 Bad Gateway and no logout**.
+- **Definitive Root Cause Proven:** The origin server (Hostinger, LiteSpeed, PHP 8.3, MariaDB, Joomla) handles the page save successfully. The **502 Bad Gateway is 100% caused by Link11's edge proxy terminating the upstream connection at ~20 seconds** before the origin server finishes its complex page compile and save operation.
+- **Next Action (Primary):** Submit the Link11 support ticket below to have Link11 increase the upstream proxy timeout (to at least 60s–120s) for `www.powerfleet.com` authenticated backend/save operations.
+
+#### How to test and bypass the Link11 / Reblaze reverse proxy (Direct-to-Origin Testing)
+
+Use these commands on macOS/Linux to route your local machine's browser directly to the Hostinger origin server (`92.112.186.38`), completely skipping Link11/Reblaze edge processing:
+
+1. **Add the origin override to `/etc/hosts`:**
+   ```zsh
+   echo "92.112.186.38 www.powerfleet.com" | sudo tee -a /etc/hosts
+   ```
+   - *Explanation:* Appends (`tee -a`) a mapping from hostname `www.powerfleet.com` to the Hostinger origin IP `92.112.186.38` inside system hosts file `/etc/hosts` using administrator privileges (`sudo`). This forces your local machine to bypass public DNS and connect directly to the origin server.
+
+2. **Flush local macOS DNS cache:**
+   ```zsh
+   sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+   ```
+   - *Explanation:* Flushes Directory Services cache (`dscacheutil -flushcache`) and restarts the macOS multicast DNS daemon (`killall -HUP mDNSResponder`) so the `/etc/hosts` modification takes effect immediately across all open browsers without restarting your Mac.
+
+3. **Verify the active hosts mapping:**
+   ```zsh
+   grep 'powerfleet' /etc/hosts
+   ```
+   - *Explanation:* Searches `/etc/hosts` for `powerfleet` to confirm that `92.112.186.38 www.powerfleet.com` is present and active.
+
+4. **Verify in browser & test:**
+   - Open a fresh Incognito/Private browser window.
+   - Open Developer Tools (`F12`) → **Network** tab.
+   - Navigate to `https://www.powerfleet.com/administrator/` and verify the `Remote Address` column shows `92.112.186.38:443` (Hostinger origin) rather than a Link11 edge IP.
+   - Perform the failing action (e.g. page builder save).
+
+5. **Revert and restore normal Link11 proxy routing:**
+   ```zsh
+   sudo sed -i '' '/92.112.186.38 www.powerfleet.com/d' /etc/hosts && sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+   ```
+   - *Explanation:* Uses stream editor (`sed -i ''`) with the delete command (`/pattern/d`) to remove the `92.112.186.38 www.powerfleet.com` line from `/etc/hosts`, and immediately flushes the local DNS cache again. Your browser will resume routing traffic through the Link11 / Reblaze reverse proxy.
+
+### Draft request to send to Link11 Support (502 Timeout / Upstream Error)
+> **Subject:** 502 Bad Gateway investigation on page save — `www.powerfleet.com` (Trace: `lon2-lb2`, 2026-09-11 11:09:17 UTC)
+>
+> We are investigating an intermittent `502 Bad Gateway` returned to content editors saving pages via the Joomla CMS / YOOtheme Pro page builder on `www.powerfleet.com`.
+>
+> **Specific Incident Details:**
+> - **Timestamp:** `2026-09-11 11:09:17 UTC` (`Fri, 11 Sep 2026 11:09:17 GMT`)
+> - **Domain / Authority:** `www.powerfleet.com`
+> - **Request Method & Path:** `POST /us/icubed-2027/`
+> - **Referer:** `https://www.powerfleet.com/administrator/index.php?option=com_ajax&p=customizer&templateStyle=20&format=html&site=https%3A%2F%2Fwww.powerfleet.com%2Fus%2Ficubed-2027%2F&return=%2Fadministrator%2Findex.php%3Foption%3Dcom_content%26view%3Darticle%26layout%3Dedit%26id%3D3594`
+> - **Payload Size:** `Content-Length: 48084` (~48 KB)
+> - **Response Header:** `X-L11-Trace: lon2-lb2`
+> - **Response Body / Server:** `502 Bad Gateway` (OpenResty)
+> - **Observed Client Wait Time:** ~19.95s (19.94s TTFB)
+>
+> **Request:**
+> 1. Please look up this request in the Link11/Reblaze access logs using timestamp `2026-09-11 11:09:17 UTC`, path `/us/icubed-2027/`, and trace `lon2-lb2`.
+> 2. Confirm the Link11 `Request_ID`, whether `sent-to-origin` was true, the upstream host/IP targeted, and the `upstream-status` received.
+> 3. Provide the upstream timing metrics (connection time, time-to-first-byte, upstream response time).
+> 4. Clarify whether Link11 terminated the request due to an edge proxy timeout (e.g. 20-second upstream timeout) or whether the origin server (`92.112.186.38`) actively returned a `502` / closed the connection.
+> 5. If this is a proxy timeout threshold, advise on the process to increase the upstream timeout for authenticated Joomla backend save routes.
