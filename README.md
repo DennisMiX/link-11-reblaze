@@ -1,6 +1,142 @@
 # link-11-reblaze
 Link11 / Reblaze project for the powerfleet marketing team to manage and log permissions and acess issues.
 
+## 2026-11-10 to 2026-11-11 - Joomla/YOOtheme live-preview 502/504 investigation
+
+### Scope and impact
+
+- YOOtheme live-preview updates fail with HTTP 502/504 on **some Joomla articles**, while the same editing workflow works on other articles. The issue is **not specific to heading changes**; changing different YOOtheme elements can trigger it.
+- The failure is initiated from Joomla's `/administrator/` editing session, but the captured preview request is a background **POST to a frontend Joomla component URL**. It is not an ordinary public GET and should not be diagnosed using only public-page loads.
+- Captured failing request: `POST https://www.powerfleet.com/us/component/content/article/on-site-4/?catid=229` (article ID `3980`, YOOtheme template style `20`). Changing a heading and waiting for live preview was the captured reproduction; the heading did not persist. The user reports other element changes and some other articles also fail.
+- Public route: `www.powerfleet.com` through Link11/Reblaze. DNS is hosted on AWS Route 53; both apex and www resolve to `128.65.223.101`. Hostinger confirms origin `92.112.186.38`.
+
+### Link11 event export findings
+
+The dashboard export contains three matching events for source IP `156.155.19.37`, host `www.powerfleet.com`, method POST, and the affected path/query. Exact UTC event data:
+
+| Timestamp | Request ID | Status | Origin/upstream response time | Request length |
+| --- | --- | ---: | ---: | ---: |
+| 2026-11-10 08:55:59.419357 | `2ef3e7fd871e26c242b4b8f95b4ba5a6` | 504 | 24.347 s | 59,410 bytes |
+| 2026-11-10 08:55:58.488920 | `ba38ad350c7a7893ae68175376dc9351` | 502 | 24.074 s | 59,406 bytes |
+| 2026-11-10 08:55:57.958961 | `eb80007f2b73dd9e24f77c224619dd84` | 504 | 24.341 s | 59,400 bytes |
+
+For all three events the export records `upstream_addr: 92.112.186.38:443`, matching `upstream_status` and `upstream_response_time`, `blocked: false`, `challenge: false`, and `monitor: true`. Link11 says the content filter is in monitor mode. Its event message says inspection of the `customizer` argument was **skipped** because of an inspection-size limit; that is not evidence the request was blocked or that this limit caused the gateway errors.
+
+The browser capture for the 504 had response date `2026-11-10 08:56:23 GMT` (UTC), `X-L11-Trace: ffm7-lb2`, remote address `128.65.223.101:443`, and Chrome Timing of 26.19 seconds total / waiting for server response. The body was `504 Gateway Time-out` from OpenResty. The response headers did not show a unique request ID; Link11 correlated the event using timestamp, IP, method and path. Browser payload `Content-Length` was 56,526 bytes, while the event export's `request_length` is about 59.4 KB; the relationship between these measurements has not been explained.
+
+**Causation remains unresolved.** The Link11 export's `upstream_status: 502/504` and approximately 24.1-24.3-second upstream time do not, by themselves, prove whether Link11 received an HTTP error from its upstream or represented a locally generated upstream failure. The dashboard labels the result “Blocked by origin,” but this label is not a raw connection error. Link11 has been asked for the raw proxy error entry and confirmation of whether an HTTP response was received versus connect/read/TLS/reset failure.
+
+### Link11 proxy settings and email-thread findings
+
+In the November 10 support email, Link11 identified the `www.powerfleet.com` proxy as **Default Proxy Template** and reported:
+
+| Setting | Link11-reported value |
+| --- | ---: |
+| Proxy connect timeout | 15 s |
+| Proxy send timeout | 30 s |
+| Proxy read timeout | 60 s |
+| Keepalive timeout | 60 s |
+| Send timeout to client | 10 s |
+
+Link11 says none is configured at 23-24 seconds and therefore does not consider the observed duration one of those configured timeout values. This does not independently identify which component generated the status or exclude other connection failures. Link11 confirmed content filtering is monitor-only and did not block these requests. No Link11 configuration changes were made.
+
+Link11 requested a HAR captured during an agreed live preview update, noting that HAR files contain session cookies. Hostinger also requested the Link11 raw event/error details and a coordinated Chrome Network/HAR capture, with no replay of the authenticated preview POST without user coordination. The captured Chrome evidence already available includes Timing, response body and headers, but HAR export/redaction and a coordinated fresh reproduction remain pending.
+
+### Hostinger investigation findings and limits
+
+Hostinger confirmed the Cloud Enterprise Plus site is active, origin IP `92.112.186.38`, with no null route, suspension, or active hosting restriction. In the reviewed configuration, `max_execution_time` and `max_input_time` are both 480 seconds; PHP, POST and memory limits were reported well above the captured request size. Hostinger found no recorded PHP-worker, process, CPU, memory or I/O fault. Historical resource metrics use 20-minute aggregation and cannot rule out a short event.
+
+Hostinger's access-log view is a **completed-request view**. It initially showed no matching failed POST during 2026-11-10 08:55-08:58 UTC; their available vhost error-log source was not a raw frontend proxy/load-balancer trace. Hostinger explicitly said this does not prove a request never reached its infrastructure or exclude a connection that failed before a completed access record was written. Their customer-facing tools do not expose the frontend proxy/TLS trace needed to distinguish connect timeout, read timeout, TLS failure, reset, or premature termination. At the time of those diagnostics, no infrastructure escalation had been confirmed; a later Hostinger live-chat update says the case has now been escalated to "our team." No ticket reference, named receiving team, scope of log access, or investigation result has yet been provided. No service changes were made.
+
+The Hostinger CSV export `hostinger/01a1c911-5b62-73e4-915f-4896f0257cb2.csv` contains five HTTP 200 records, including three successful POSTs to the affected path at 08:46:02, 08:54:07 and 08:54:30 UTC, plus YOOtheme customizer GETs. It contains no records in the 08:55-08:58 failure window. The rows list source addresses `85.131.144.246` and `85.131.144.248`, not the browser/editor IP; whether these are Link11 origin-facing addresses is unconfirmed. The column is named `durationMs` and values for the POSTs are 290.809, 338.436 and 356.164, which correspond to about 0.29-0.36 seconds if the unit label is correct. Hostinger has not yet clarified the duration semantics. These successful requests show that this path sometimes succeeds; they do not capture the failed requests or explain their cause.
+
+Hostinger's read-only direct-origin GET checks used `curl -k` after normal certificate validation failed with an expired-certificate error. With `www.powerfleet.com` retained as hostname/SNI and connection directed to `92.112.186.38`, `/us/on-site/` returned 200 and the affected component URL returned 404 in about 1.20/1.27 seconds. These were unauthenticated GETs, not the authenticated YOOtheme preview POST; they do not reproduce the issue. The 404 may relate to publication/access state and has not been established as the timeout cause. Hostinger reports the origin certificate for apex and www expired on 2026-10-20. Its removal-first Lifetime/custom SSL reinstall has no stated zero-downtime or automatic rollback guarantee. No DNS or SSL changes have been approved.
+
+### Hostinger chat transcript update (through 2026-11-11 09:38 chat time)
+
+The exported chat transcript is `hostinger/chat-transcript.txt`. It adds the following support history and status:
+
+- An initial Hostinger response attributed the SSL/site issue to using AWS nameservers and suggested pointing DNS at Hostinger. This conflicts with the verified and intentional production topology: AWS Route 53 is authoritative DNS and public web traffic points to Link11/Reblaze. The user explicitly instructed Hostinger not to change DNS; **no DNS change was made or authorized**.
+- Hostinger then confirmed Cloud Enterprise Plus is active and repeated the diagnostic results and limitations above. The agent stated that the customer-facing tools could not expose frontend proxy/load-balancer or TLS traces. On 2026-11-10 19:29, the Hostinger Agent explicitly could not confirm an infrastructure ticket or assigned infrastructure team and could not verify whether internal infrastructure staff could inspect those traces. No support-policy reference or ticket number was supplied.
+- The user requested human support; a later chat agent identified themself as Nancy/Nacy and continued the review. On 2026-11-10 22:07 the agent explicitly said **no infrastructure escalation had been opened**. In a subsequent live-chat response (received 2026-11-11; exact time not supplied), Hostinger said the issue **had been escalated to "our team"** and they would follow up. The newer statement supersedes the earlier status, but does not identify the team as infrastructure or provide a ticket/reference; request those details.
+- Hostinger asked for Link11's raw error and a coordinated Chrome Network/HAR capture during a live-preview update. The user supplied the three-event Link11 summary and asked Hostinger to correlate it with frontend infrastructure logs. The transcript ends after that evidence was provided; it does not show a HAR being exported or sent, a controlled authenticated POST reproduction, or a Link11 raw error being received.
+- The agent's direct-origin connectivity tests were unauthenticated GETs. The initial certificate-validated request failed with expired-certificate error; subsequent HTTP status checks used diagnostic-only `curl -k`. Results were `/us/on-site/` 200 and the affected component URL 404 at 20:41:05/20:41:06 UTC, taking about 1.20/1.27 seconds. Hostinger did not independently verify matching access-log records. These GET tests are not evidence about the authenticated preview POST.
+- Hostinger requested a comparison with a known-working article. The user supplied `https://www.powerfleet.com/us/on-site/` as a working YOOtheme live-preview example and clarified that **any YOOtheme element update** can fail on some articles, while other articles work; the issue is not heading-specific.
+- A later Hostinger message again asked whether the issue was related to `powerfleet.com`; the user reconfirmed it was. No production settings, SSL, DNS, proxy, PHP or hosting services were changed, and the transcript records no authorized restart or authenticated POST replay.
+
+**Current support status:** Hostinger now says the case has been escalated to "our team," but has not supplied a ticket reference, named the receiving team, or confirmed it can access frontend proxy/TLS traces. Await the escalation details and findings. The missing evidence remains the raw frontend proxy/TLS connection trace and correlation of the failed authenticated preview POST at both providers.
+
+### Evidence handling
+
+- Email thread: [link-11-support/RE_ Powerfleet.com - Editor Issues.pdf](link-11-support/RE_%20Powerfleet.com%20-%20Editor%20Issues.pdf). Contains Link11's reported timeout values, event IDs and request for event export.
+- Link11 event export: `link-11-support/link-11-dashboards.json` (21 events; about 33 MB). This raw export includes cookies/session-related fields and is untracked. Do not commit or forward it unredacted. Relevant incident metadata is summarized above; no cookies, session IDs, or request payloads are copied into this README.
+- Hostinger request-log export: `hostinger/01a1c911-5b62-73e4-915f-4896f0257cb2.csv` (5 records; untracked). Treat as operational evidence and do not commit unless deliberately approved.
+- Hostinger chat export: `hostinger/chat-transcript.txt` (untracked). It contains support conversation details; retain locally and review/redact before sharing outside approved support channels.
+- Chrome screenshots are under `screenshots/10112026/`; some header screenshots expose cookies. Do not forward those screenshots or any HAR without removing cookies, authorization headers, session identifiers and sensitive request data. Prefer a sanitized HAR shared via an approved secure channel.
+
+### Current next steps
+
+1. Obtain Link11's raw proxy error for request `2ef3e7fd871e26c242b4b8f95b4ba5a6`; ask whether the 504 was an actual HTTP response received from `92.112.186.38:443` or a proxy-generated upstream failure, and request connection/TLS/header/response timings and termination reason. Preserve the three request IDs above.
+2. Continue Hostinger escalation for frontend proxy/load-balancer/TLS connection evidence in the same UTC window. Correlate using host, path, Link11's source address if identified, and exact timestamps. Absence from the completed access log is inconclusive.
+3. If historical logs are unavailable, coordinate **one** controlled YOOtheme element update on a known failing article while both teams capture the same request. Compare against a known working article using the authenticated preview POST workflow, not public GETs. Agree the time, log capture, and safe test article first; do not replay POSTs or repeatedly retry without coordination.
+4. Keep DNS, Link11 policy/timeouts, Hostinger SSL, and hosting settings unchanged until the teams identify the failing hop and propose a reviewed change. Do not disable certificate validation, use HTTP for editor login, or treat a customizer inspection-size message as proof of WAF blocking.
+
+## 2026-11-09 - Current routing, origin SSL and safe change order
+
+**Do not approve the pending Hostinger SSL reinstall yet.** Hostinger reports that its reinstall may remove the existing certificate before issuing a replacement, with no guaranteed uninterrupted HTTPS or automatic rollback. Unchanged public DNS does not guarantee availability if Link11 loses its origin connection.
+
+### Verified setup and evidence limits
+
+Public DNS queries on 2026-11-09 returned:
+
+| Layer | Evidence | Meaning |
+| --- | --- | --- |
+| Authoritative DNS | `ns-1107.awsdns-10.org`, `ns-2000.awsdns-58.co.uk`, `ns-367.awsdns-45.com`, `ns-571.awsdns-07.net` | AWS Route 53 hosts authoritative DNS for `powerfleet.com`. This does not establish that AWS hosts Joomla or proxies its traffic. |
+| Public apex | `powerfleet.com A 128.65.223.101`, confirmed directly by authoritative server `ns-367.awsdns-45.com` | Public traffic resolves to the proxy address, not the Hostinger origin. |
+| Public www | `www.powerfleet.com A 128.65.223.101`, agreeing through the authoritative server, Cloudflare `1.1.1.1` and Google `8.8.8.8` resolvers | Same public proxy destination. No CNAME or AAAA answer was returned for `www` in the checks. |
+| Public HTTPS | Valid certificate verification; test HEAD request returned HTTP `247` and `X-L11-Trace: ffm7-lb2` from `128.65.223.101` | Link11/Reblaze is handling this public request. A command-line challenge does not prove every browser session fails. |
+| Hostinger origin | Hostinger support confirms `92.112.186.38`; separate direct HTTPS checks with SNI `www.powerfleet.com` and `powerfleet.com` both fail certificate validation as expired | Local hosts overrides cannot currently provide normally trusted browser HTTPS. |
+| Certificate dates | Hostinger reports certificates for apex and www expired on 2026-10-20 | Direct tests independently confirm expiry failures for both names, not the exact expiry date or full certificate coverage. |
+
+The observed architecture is:
+
+```text
+AWS Route 53 DNS -> resolves apex/www to 128.65.223.101
+Browser -> HTTPS -> Link11/Reblaze public edge -> configured upstream -> Hostinger/Joomla
+                                                                        92.112.186.38
+```
+
+The upstream address is based on Hostinger's confirmation and the historical origin test, not inspection of current Link11 configuration. **Still unverified:** Link11's configured upstream address, HTTP versus HTTPS, port, SNI hostname, origin certificate-validation policy, failover and current timeouts. Public DNS cannot reveal these settings. No CloudFront or AWS load balancer has been established by these checks; a Route 53 alias or other account-level configuration cannot be ruled out without console access.
+
+DNSChecker (`https://dnschecker.org/#A/www.powerfleet.com`) could not be retrieved from this environment; the evidence above comes from direct DNS queries, not a worldwide propagation audit. No AWS, Hostinger or Link11 account configuration was changed.
+
+### Lowest-risk sequence
+
+1. **Restore editor access through Link11 first, independently of SSL.** Ask the external Link11 team for trusted-source bot-challenge exceptions and targeted WAF false-positive fixes. Include `/administrator/`, relevant AJAX endpoints and actual frontend YOOtheme preview/save routes: the September failing save was `POST /us/icubed-2027/`. Verify current editor egress IPs rather than reusing September addresses. Keep Joomla authentication and unrelated protections enabled; do not make a public, unrestricted admin bypass.
+2. **Handle save timeouts separately.** Ask Link11 to confirm upstream timing and timeout settings. Historical origin saves took 286-320 seconds; a 60-120-second timeout alone would not accommodate those durations. Investigate slow Joomla/YOOtheme processing as well.
+3. **Get Hostinger's exact certificate-validation requirements before reinstalling.** Request the method, hostnames and any required paths or DNS records. Have Link11 permit only the necessary validation requests if HTTP validation is used. This preparation does not require starting the reinstall.
+4. **Prefer issuance before replacement.** Ask whether Hostinger supports installing a pre-issued custom certificate and whether the replacement interrupts HTTPS. DNS validation could issue a certificate without changing website routing, if supported. In Route 53, add only the issuer-specified validation record in the correct public hosted zone, through an authorized DNS administrator. Do not delete existing validation records or share AWS credentials/private keys in tickets or this repo. Establish a supported renewal process and expiry monitoring; a one-off custom install does not establish automatic renewal.
+5. **Install only with an agreed recovery procedure.** If Hostinger can only remove first and issue afterward, there is no zero-downtime guarantee: use a low-traffic maintenance window with support available. Have Link11's upstream settings and validation access confirmed beforehand. Recovery must restore working origin TLS; reinstalling an expired certificate is not a trusted-HTTPS repair. Do not switch production traffic to unencrypted HTTP or disable certificate checks as a workaround.
+6. **Verify after replacement.** Check trusted direct-origin HTTPS for both hostnames, public HTTPS through Link11, Joomla login and a controlled builder save. Confirm renewal prerequisites and who monitors expiry. A successful HEAD request does not validate a complete editor workflow.
+
+**Keep AWS routing unchanged:** no nameserver changes, no apex/www A/alias/CNAME changes, no move to Hostinger DNS and no public origin exposure to get SSL installed. Route 53 serves DNS; it does not install Hostinger's certificate. An AWS ACM certificate is not automatically deployed to Hostinger; any certificate route must be explicitly supported by the destination and renewal workflow.
+
+### Read-only verification commands
+
+These commands do not change DNS, the hosts file or hosting settings. `--resolve` preserves the URL hostname for SNI and certificate verification while selecting the destination IP. Do not add `-k`.
+
+```zsh
+dig @1.1.1.1 powerfleet.com NS +noall +answer
+dig @1.1.1.1 powerfleet.com A +noall +answer
+dig @1.1.1.1 www.powerfleet.com A +noall +answer
+dig @8.8.8.8 www.powerfleet.com A +noall +answer
+curl -I --connect-timeout 10 --max-time 20 https://www.powerfleet.com/
+curl -I --connect-timeout 10 --max-time 20 --resolve www.powerfleet.com:443:92.112.186.38 https://www.powerfleet.com/
+curl -I --connect-timeout 10 --max-time 20 --resolve powerfleet.com:443:92.112.186.38 https://powerfleet.com/
+```
+
+Keep normal editor work on the public proxy route. If a local hosts override remains from earlier diagnostics, remove only that mapping and flush local DNS before testing Link11 policy changes. Direct-origin testing should remain approved and temporary, not a substitute for fixing editor access at the WAF.
+
 ## 2026-09-06 to 2026-09-08 — Site-down incident (Hostinger nullroute + Link11 WAF DDoS)
 
 Sources: [down-site-logs/fresh-new-site-issues.txt](down-site-logs/fresh-new-site-issues.txt), [down-site-logs/transcript-08-09-26.txt](down-site-logs/transcript-08-09-26.txt), [down-site-logs/transcript-08-09-26-1235.txt](down-site-logs/transcript-08-09-26-1235.txt) (fullest/final version of the Hostinger support chat, running 07:55–12:34 UTC on 2026-09-08), [incident-report/Incident Report - Powerfleet DDoS 2026-09-08.docx](incident-report/Incident%20Report%20-%20Powerfleet%20DDoS%202026-09-08.docx), [incident-report/Link11WAF-www.powerfleet.comLogs_2026-09-08.json](incident-report/Link11WAF-www.powerfleet.comLogs_2026-09-08.json).
@@ -199,16 +335,20 @@ Sources: [screenshots/502-ange-screenshots-ytp-joomla/](screenshots/502-ange-scr
 - **Subsequent Traffic:** Subsequent requests (tracking pixels, Google Analytics, clarity, and Joomla session keepalive calls `index.php?option=com_ajax&format=json`) immediately succeeded with HTTP `200`. No WAF challenge or 473 denial was returned.
 
 ### Hostinger investigation findings (2026-09-14)
+
+**Historical-scope note (updated 2026-11-11):** the timeout and direct-origin conclusions below refer to the distinct 2026-09-11 save event only. They are not proof of the cause of the November 2026 preview failures. Link11 subsequently reported a 60-second proxy read timeout for the current `www.powerfleet.com` Default Proxy Template; see the 2026-11-10 to 2026-11-11 investigation above.
 - **Origin execution duration:** Neighboring successful `POST /us/icubed-2027/` requests at 11:05:15 UTC and 11:07:52 UTC took **286 to 320 seconds (~5 minutes)** each to complete on the origin server.
 - **LVE Limits:** Normal across the 10:00–12:00 UTC window (CPU ~5%, RAM ~600MB of 15GB, PHP workers 11 of 400). No account-level throttling or resource exhaustion occurred.
-- **Root cause:** The 502 Bad Gateway was an **upstream proxy timeout mismatch**: Link11/OpenResty has a default ~20-second upstream timeout, whereas the Joomla/YOOtheme save operation on this heavy page required ~300 seconds to finish processing due to YOOtheme Next-Gen Image (WebP) dynamic re-rendering on every save. Because the origin took minutes to reply, Link11 terminated the upstream connection at ~20s and rendered the 502 (and caused the browser to lose/invalidate the editor session state).
+- **2026-09-11 incident interpretation:** The evidence at that time was interpreted as an upstream proxy timeout mismatch: the browser received a 502 after about 20 seconds while neighboring origin saves took roughly 5 minutes. This was the working diagnosis for that specific incident; do not generalize its assumed timeout value or cause to later requests without matching logs.
 
 ### Solution & Resolution Testing (2026-09-14)
 - **Direct Origin Bypass Test (`/etc/hosts` → `92.112.186.38`):** ✅ **100% SUCCESS.** When bypassing Link11/Reblaze and saving `icubed-2027` directly on the Hostinger origin, the save completed cleanly with **no 502 Bad Gateway and no logout**.
-- **Definitive Root Cause Proven:** The origin server (Hostinger, LiteSpeed, PHP 8.3, MariaDB, Joomla) handles the page save successfully. The **502 Bad Gateway is 100% caused by Link11's edge proxy terminating the upstream connection at ~20 seconds** before the origin server finishes its complex page compile and save operation.
-- **Next Action (Primary):** Submit the Link11 support ticket below to have Link11 increase the upstream proxy timeout (to at least 60s–120s) for `www.powerfleet.com` authenticated backend/save operations.
+- **Direct-origin test result:** The `icubed-2027` save completed successfully when tested directly against Hostinger on 2026-09-14. This is evidence for that page/test at that time, not proof of the November issue's cause.
+- **Historical next action:** A Link11 timeout increase was proposed for this September event. Do not apply that proposal to the November incidents without new evidence; Link11's later-reported current template uses a 60-second read timeout and the November exports do not include a raw connection error.
 
 #### How to test and bypass the Link11 / Reblaze reverse proxy (Direct-to-Origin Testing)
+
+**Historical procedure - not currently ready for use (2026-11-09):** direct-origin HTTPS certificate verification fails as expired. Follow the current SSL/change-order section above before repeating this test. Never ignore certificate warnings for CMS logins. The cache-flush commands below are macOS-specific; browser connection reuse can require a browser restart. A hosts-file entry alone does not prove the actual connection destination.
 
 Use these commands on macOS/Linux to route your local machine's browser directly to the Hostinger origin server (`92.112.186.38`), completely skipping Link11/Reblaze edge processing:
 
